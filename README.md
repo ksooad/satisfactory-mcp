@@ -4,7 +4,7 @@ An in-game MCP server for Satisfactory (SML mod): control building and productio
 
 > Single-player Creative/sandbox only. This is an automation tool, not a multiplayer cheat: the server binds to `127.0.0.1` exclusively.
 
-## Capabilities (26 tools)
+## Capabilities (29 tools)
 
 | Group | Tools |
 |---|---|

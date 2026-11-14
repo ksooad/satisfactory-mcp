@@ -49,6 +49,10 @@
 #include "FGPowerConnectionComponent.h"
 #include "FGPowerInfoComponent.h"
 #include "UObject/UnrealType.h"
+#include "Railroad/FGRailroadSubsystem.h"
+#include "Railroad/FGRailroadTimeTable.h"
+#include "Railroad/FGTrain.h"
+#include "Railroad/FGTrainStationIdentifier.h"
 
 namespace
 {
@@ -2440,6 +2444,329 @@ FMcpToolResult ToolSetPhase(const TSharedPtr<FJsonObject>& Args)
 	return Result.IsEmpty() ? FMcpToolResult{true, TEXT("{\"error\":\"game thread timeout\"}")} : FMcpToolResult{false, Result};
 }
 
+
+	FMcpToolResult ToolListTrains(const TSharedPtr<FJsonObject>& Args)
+	{
+		UWorld* World = GetGameWorld();
+		if (!World)
+		{
+			return {true, TEXT("{\"error\":\"no active game world\"}")};
+		}
+		int32 Limit = 50;
+		Args->TryGetNumberField(TEXT("limit"), Limit);
+
+		FString Result;
+		RunOnGameThread([&World, Limit, &Result]()
+		{
+			AFGRailroadSubsystem* RS = AFGRailroadSubsystem::Get(World);
+			if (!RS)
+			{
+				Result = TEXT("{\"error\":\"no railroad subsystem found\"}");
+				return;
+			}
+
+			TArray<AFGTrain*> AllTrains;
+			RS->GetAllTrains(AllTrains);
+
+			TArray<TSharedPtr<FJsonValue>> TrainItems;
+			for (AFGTrain* Train : AllTrains)
+			{
+				if (!Train || !IsValid(Train)) continue;
+				if (TrainItems.Num() >= Limit) break;
+
+				TSharedRef<FJsonObject> TrainObj = MakeShared<FJsonObject>();
+				TrainObj->SetStringField(TEXT("name"), Train->GetTrainName().ToString());
+				TrainObj->SetBoolField(TEXT("isSelfDriving"), Train->IsSelfDrivingEnabled());
+
+				// Locomotives / Vehicles
+				TArray<TSharedPtr<FJsonValue>> VehiclesArr;
+				TArray<AFGVehicle*> Vehicles;
+				Train->GetVehicles(Vehicles);
+				for (AFGVehicle* V : Vehicles)
+				{
+					if (!V || !IsValid(V)) continue;
+					const FVector Loc = V->GetActorLocation();
+					TSharedRef<FJsonObject> VObj = MakeShared<FJsonObject>();
+					VObj->SetStringField(TEXT("class"), V->GetClass()->GetName());
+					VObj->SetNumberField(TEXT("x"), Loc.X / 100.0);
+					VObj->SetNumberField(TEXT("y"), Loc.Y / 100.0);
+					VObj->SetNumberField(TEXT("z"), Loc.Z / 100.0);
+					VehiclesArr.Add(MakeShared<FJsonValueObject>(VObj));
+				}
+				TrainObj->SetArrayField(TEXT("vehicles"), VehiclesArr);
+
+				// Timetable
+				AFGRailroadTimeTable* TT = Train->GetTimeTable();
+				if (TT)
+				{
+					TrainObj->SetNumberField(TEXT("currentStop"), TT->GetCurrentStop());
+					TArray<FTimeTableStop> Stops;
+					TT->GetStops(Stops);
+					TArray<TSharedPtr<FJsonValue>> StopsArr;
+					for (int32 i = 0; i < Stops.Num(); ++i)
+					{
+						const FTimeTableStop& Stop = Stops[i];
+						TSharedRef<FJsonObject> StopObj = MakeShared<FJsonObject>();
+						StopObj->SetNumberField(TEXT("index"), i);
+						FString StationName = TEXT("Unknown");
+						if (Stop.Station && IsValid(Stop.Station))
+						{
+							StationName = Stop.Station->GetStationName().ToString();
+							const FVector SLoc = Stop.Station->GetActorLocation();
+							StopObj->SetNumberField(TEXT("x"), SLoc.X / 100.0);
+							StopObj->SetNumberField(TEXT("y"), SLoc.Y / 100.0);
+							StopObj->SetNumberField(TEXT("z"), SLoc.Z / 100.0);
+						}
+						StopObj->SetStringField(TEXT("stationName"), StationName);
+						StopObj->SetNumberField(TEXT("rule"), (int32)Stop.RuleSet.Definition);
+						StopObj->SetNumberField(TEXT("duration"), Stop.RuleSet.Duration);
+						StopsArr.Add(MakeShared<FJsonValueObject>(StopObj));
+					}
+					TrainObj->SetArrayField(TEXT("stops"), StopsArr);
+				}
+				else
+				{
+					TrainObj->SetArrayField(TEXT("stops"), TArray<TSharedPtr<FJsonValue>>());
+				}
+
+				TrainItems.Add(MakeShared<FJsonValueObject>(TrainObj));
+			}
+
+			TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+			Root->SetNumberField(TEXT("totalTrains"), AllTrains.Num());
+			Root->SetArrayField(TEXT("trains"), TrainItems);
+
+			FString Out;
+			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
+			FJsonSerializer::Serialize(Root, Writer);
+			Result = MoveTemp(Out);
+		});
+		return Result.IsEmpty() ? FMcpToolResult{true, TEXT("{\"error\":\"game thread timeout\"}")} : FMcpToolResult{false, Result};
+	}
+
+	FMcpToolResult ToolSetTrainTimetable(const TSharedPtr<FJsonObject>& Args)
+	{
+		UWorld* World = GetGameWorld();
+		if (!World)
+		{
+			return {true, TEXT("{\"error\":\"no active game world\"}")};
+		}
+
+		FString TrainName;
+		Args->TryGetStringField(TEXT("train_name"), TrainName);
+		double NX = 0.0, NY = 0.0, NZ = 0.0, Radius = 100.0;
+		const bool bNear = Args->TryGetNumberField(TEXT("near_x"), NX)
+			&& Args->TryGetNumberField(TEXT("near_y"), NY)
+			&& Args->TryGetNumberField(TEXT("near_z"), NZ);
+		Args->TryGetNumberField(TEXT("radius_m"), Radius);
+
+		bool bSelfDriving = false;
+		const bool bHasSelfDriving = Args->TryGetBoolField(TEXT("self_driving"), bSelfDriving);
+
+		const TArray<TSharedPtr<FJsonValue>>* StopsJson = nullptr;
+		Args->TryGetArrayField(TEXT("stops"), StopsJson);
+
+		FString Result;
+		RunOnGameThread([&World, TrainName, bNear, NX, NY, NZ, Radius, bHasSelfDriving, bSelfDriving, StopsJson, &Result]()
+		{
+			AFGRailroadSubsystem* RS = AFGRailroadSubsystem::Get(World);
+			if (!RS)
+			{
+				Result = TEXT("{\"error\":\"no railroad subsystem\"}");
+				return;
+			}
+
+			TArray<AFGTrain*> AllTrains;
+			RS->GetAllTrains(AllTrains);
+
+			// Find target train
+			AFGTrain* TargetTrain = nullptr;
+			const FVector NearPos(NX * 100.0, NY * 100.0, NZ * 100.0);
+			float BestDistSq = (Radius * 100.0) * (Radius * 100.0);
+
+			for (AFGTrain* T : AllTrains)
+			{
+				if (!T || !IsValid(T)) continue;
+				if (!TrainName.IsEmpty() && T->GetTrainName().ToString().Contains(TrainName))
+				{
+					TargetTrain = T;
+					break;
+				}
+				if (bNear)
+				{
+					TArray<AFGVehicle*> Vehicles;
+					T->GetVehicles(Vehicles);
+					for (AFGVehicle* V : Vehicles)
+					{
+						if (!V || !IsValid(V)) continue;
+						const float DistSq = FVector::DistSquared(V->GetActorLocation(), NearPos);
+						if (DistSq < BestDistSq)
+						{
+							BestDistSq = DistSq;
+							TargetTrain = T;
+						}
+					}
+				}
+			}
+
+			if (!TargetTrain)
+			{
+				Result = TEXT("{\"error\":\"no matching train found\"}");
+				return;
+			}
+
+			AFGRailroadTimeTable* TT = TargetTrain->GetTimeTable();
+			if (!TT)
+			{
+				TT = TargetTrain->NewTimeTable();
+			}
+			if (!TT)
+			{
+				Result = TEXT("{\"error\":\"failed to get or create timetable for train\"}");
+				return;
+			}
+
+			// Collect all stations in world to resolve station names / coordinates
+			TArray<AFGTrainStationIdentifier*> AllStations;
+			RS->GetAllTrainStationIdentifiers(AllStations);
+
+			if (StopsJson)
+			{
+				TArray<FTimeTableStop> NewStops;
+				for (const TSharedPtr<FJsonValue>& StopVal : *StopsJson)
+				{
+					const TSharedPtr<FJsonObject> StopObj = StopVal->AsObject();
+					if (!StopObj.IsValid()) continue;
+
+					FString StationName;
+					StopObj->TryGetStringField(TEXT("station_name"), StationName);
+					double SX = 0.0, SY = 0.0, SZ = 0.0;
+					const bool bStopNear = StopObj->TryGetNumberField(TEXT("near_x"), SX)
+						&& StopObj->TryGetNumberField(TEXT("near_y"), SY)
+						&& StopObj->TryGetNumberField(TEXT("near_z"), SZ);
+
+					AFGTrainStationIdentifier* BestStation = nullptr;
+					float BestStationDistSq = 1e12f;
+
+					for (AFGTrainStationIdentifier* St : AllStations)
+					{
+						if (!St || !IsValid(St)) continue;
+						if (!StationName.IsEmpty() && St->GetStationName().ToString().Contains(StationName))
+						{
+							BestStation = St;
+							break;
+						}
+						if (bStopNear)
+						{
+							const float DSq = FVector::DistSquared(St->GetActorLocation(), FVector(SX * 100.0, SY * 100.0, SZ * 100.0));
+							if (DSq < BestStationDistSq)
+							{
+								BestStationDistSq = DSq;
+								BestStation = St;
+							}
+						}
+					}
+
+					if (!BestStation)
+					{
+						Result = FString::Printf(TEXT("{\"error\":\"station not found: %s\"}"), *StationName);
+						return;
+					}
+
+					FTimeTableStop Stop;
+					Stop.Station = BestStation;
+
+					FString RuleStr;
+					StopObj->TryGetStringField(TEXT("rule"), RuleStr);
+					double Duration = 0.0;
+					StopObj->TryGetNumberField(TEXT("duration"), Duration);
+
+					Stop.RuleSet.Duration = Duration;
+					if (RuleStr == TEXT("full") || RuleStr == TEXT("fully_load_unload"))
+					{
+						Stop.RuleSet.Definition = (ETrainDockingRuleSetDefinition)1;
+					}
+					else
+					{
+						Stop.RuleSet.Definition = (ETrainDockingRuleSetDefinition)0;
+					}
+
+					NewStops.Add(Stop);
+				}
+
+				TT->SetStops(NewStops);
+			}
+
+			if (bHasSelfDriving)
+			{
+				TargetTrain->SetSelfDrivingEnabled(bSelfDriving);
+			}
+
+			TSharedRef<FJsonObject> Resp = MakeShared<FJsonObject>();
+			Resp->SetBoolField(TEXT("ok"), true);
+			Resp->SetStringField(TEXT("trainName"), TargetTrain->GetTrainName().ToString());
+			Resp->SetBoolField(TEXT("isSelfDriving"), TargetTrain->IsSelfDrivingEnabled());
+			Resp->SetNumberField(TEXT("numStops"), TT->GetNumStops());
+
+			FString Out;
+			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
+			FJsonSerializer::Serialize(Resp, Writer);
+			Result = MoveTemp(Out);
+		});
+		return Result.IsEmpty() ? FMcpToolResult{true, TEXT("{\"error\":\"game thread timeout\"}")} : FMcpToolResult{false, Result};
+	}
+
+	FMcpToolResult ToolSetTrainSelfDriving(const TSharedPtr<FJsonObject>& Args)
+	{
+		UWorld* World = GetGameWorld();
+		if (!World)
+		{
+			return {true, TEXT("{\"error\":\"no active game world\"}")};
+		}
+
+		FString TrainName;
+		Args->TryGetStringField(TEXT("train_name"), TrainName);
+		bool bEnable = true;
+		Args->TryGetBoolField(TEXT("enabled"), bEnable);
+
+		FString Result;
+		RunOnGameThread([&World, TrainName, bEnable, &Result]()
+		{
+			AFGRailroadSubsystem* RS = AFGRailroadSubsystem::Get(World);
+			if (!RS)
+			{
+				Result = TEXT("{\"error\":\"no railroad subsystem\"}");
+				return;
+			}
+
+			TArray<AFGTrain*> AllTrains;
+			RS->GetAllTrains(AllTrains);
+
+			AFGTrain* TargetTrain = nullptr;
+			for (AFGTrain* T : AllTrains)
+			{
+				if (T && IsValid(T) && T->GetTrainName().ToString().Contains(TrainName))
+				{
+					TargetTrain = T;
+					break;
+				}
+			}
+
+			if (!TargetTrain)
+			{
+				Result = TEXT("{\"error\":\"no matching train found\"}");
+				return;
+			}
+
+			TargetTrain->SetSelfDrivingEnabled(bEnable);
+
+			Result = FString::Printf(TEXT("{\"ok\":true,\"trainName\":\"%s\",\"isSelfDriving\":%s}"),
+				*TargetTrain->GetTrainName().ToString(),
+				TargetTrain->IsSelfDrivingEnabled() ? TEXT("true") : TEXT("false"));
+		});
+		return Result.IsEmpty() ? FMcpToolResult{true, TEXT("{\"error\":\"game thread timeout\"}")} : FMcpToolResult{false, Result};
+	}
+
 FString FMcpTools::GetToolsListJson()
 {
 	static const TCHAR* ToolsJsonA = LR"json([
@@ -2474,7 +2801,16 @@ FString FMcpTools::GetToolsListJson()
 	{"name":"power_check","description":"Power diagnostics near point: generators (canStart, capacity MW) and consumers actual vs target consumption MW (0 actual = unpowered or idle). Args: near_x,near_y,radius_m.","inputSchema":{"type":"object","properties":{"near_x":{"type":"number"},"near_y":{"type":"number"},"radius_m":{"type":"number"}},"required":["near_x","near_y"]}},
 	{"name":"dismantle","description":"Dismantle nearest buildable to x,y,z within radius_m (optional name substring filter). Args: x,y,z,radius_m,name,apply (default true; false = preview target only),force (hard-destroy if the game event leaves the actor alive).","inputSchema":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"},"radius_m":{"type":"number"},"name":{"type":"string"},"apply":{"type":"boolean"},"force":{"type":"boolean"}},"required":["x","y","z"]}}
 ])json";
-	return FString(ToolsJsonA) + FString(ToolsJsonA2) + FString(ToolsJsonB);
+	static const TCHAR* ToolsJsonRailroad = LR"json(
+	,{"name":"list_trains","description":"List all trains on the railroad network: train name, self-driving status, vehicles, current stop, and configured timetable stops with rules and wait durations. Args: limit (default 50).","inputSchema":{"type":"object","properties":{"limit":{"type":"integer"}}}},
+	{"name":"set_train_timetable","description":"Configure timetable and self-driving status of a train. Target train by train_name or near locomotive coords. Stops: array of { station_name, near_x/y/z, rule ('once'|'full'), duration (seconds) }. Toggle self_driving (bool).","inputSchema":{"type":"object","properties":{"train_name":{"type":"string"},"near_x":{"type":"number"},"near_y":{"type":"number"},"near_z":{"type":"number"},"radius_m":{"type":"number"},"self_driving":{"type":"boolean"},"stops":{"type":"array","items":{"type":"object","properties":{"station_name":{"type":"string"},"near_x":{"type":"number"},"near_y":{"type":"number"},"near_z":{"type":"number"},"rule":{"type":"string","enum":["once","full"]},"duration":{"type":"number"}}}}}}},
+	{"name":"set_train_self_driving","description":"Enable or disable self-driving for a specific train by name. Args: train_name (string), enabled (bool, default true).","inputSchema":{"type":"object","properties":{"train_name":{"type":"string"},"enabled":{"type":"boolean"}},"required":["train_name"]}}
+)json";
+	FString BStr = FString(ToolsJsonB).TrimEnd();
+	if (BStr.EndsWith(TEXT("]"))) {
+		BStr.LeftChopInline(1);
+	}
+	return FString(ToolsJsonA) + FString(ToolsJsonA2) + BStr + FString(ToolsJsonRailroad) + TEXT("]");
 }
 
 FMcpToolResult FMcpTools::Call(const FString& ToolName, const FString& ParamsJson)
@@ -2593,6 +2929,18 @@ FMcpToolResult FMcpTools::Call(const FString& ToolName, const FString& ParamsJso
 	if (ToolName == TEXT("set_phase"))
 	{
 		return ToolSetPhase(Args);
+	}
+	if (ToolName == TEXT("list_trains"))
+	{
+		return ToolListTrains(Args);
+	}
+	if (ToolName == TEXT("set_train_timetable"))
+	{
+		return ToolSetTrainTimetable(Args);
+	}
+	if (ToolName == TEXT("set_train_self_driving"))
+	{
+		return ToolSetTrainSelfDriving(Args);
 	}
 
 	FMcpToolResult Unknown;
