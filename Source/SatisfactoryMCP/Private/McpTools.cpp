@@ -49,10 +49,13 @@
 #include "FGPowerConnectionComponent.h"
 #include "FGPowerInfoComponent.h"
 #include "UObject/UnrealType.h"
-#include "Railroad/FGRailroadSubsystem.h"
-#include "Railroad/FGRailroadTimeTable.h"
-#include "Railroad/FGTrain.h"
-#include "Railroad/FGTrainStationIdentifier.h"
+#include "FGRailroadSubsystem.h"
+#include "FGRailroadTimeTable.h"
+#include "FGTrain.h"
+#include "FGTrainStationIdentifier.h"
+#include "FGTrainDockingRules.h"
+#include "FGLocomotive.h"
+#include "FGRailroadVehicle.h"
 
 namespace
 {
@@ -2480,18 +2483,18 @@ FMcpToolResult ToolSetPhase(const TSharedPtr<FJsonObject>& Args)
 
 				// Locomotives / Vehicles
 				TArray<TSharedPtr<FJsonValue>> VehiclesArr;
-				TArray<AFGVehicle*> Vehicles;
-				Train->GetVehicles(Vehicles);
-				for (AFGVehicle* V : Vehicles)
+				if (AFGLocomotive* Master = Train->GetMultipleUnitMaster())
 				{
-					if (!V || !IsValid(V)) continue;
-					const FVector Loc = V->GetActorLocation();
-					TSharedRef<FJsonObject> VObj = MakeShared<FJsonObject>();
-					VObj->SetStringField(TEXT("class"), V->GetClass()->GetName());
-					VObj->SetNumberField(TEXT("x"), Loc.X / 100.0);
-					VObj->SetNumberField(TEXT("y"), Loc.Y / 100.0);
-					VObj->SetNumberField(TEXT("z"), Loc.Z / 100.0);
-					VehiclesArr.Add(MakeShared<FJsonValueObject>(VObj));
+					if (IsValid(Master))
+					{
+						const FVector Loc = Master->GetActorLocation();
+						TSharedRef<FJsonObject> VObj = MakeShared<FJsonObject>();
+						VObj->SetStringField(TEXT("class"), Master->GetClass()->GetName());
+						VObj->SetNumberField(TEXT("x"), Loc.X / 100.0);
+						VObj->SetNumberField(TEXT("y"), Loc.Y / 100.0);
+						VObj->SetNumberField(TEXT("z"), Loc.Z / 100.0);
+						VehiclesArr.Add(MakeShared<FJsonValueObject>(VObj));
+					}
 				}
 				TrainObj->SetArrayField(TEXT("vehicles"), VehiclesArr);
 
@@ -2518,8 +2521,8 @@ FMcpToolResult ToolSetPhase(const TSharedPtr<FJsonObject>& Args)
 							StopObj->SetNumberField(TEXT("z"), SLoc.Z / 100.0);
 						}
 						StopObj->SetStringField(TEXT("stationName"), StationName);
-						StopObj->SetNumberField(TEXT("rule"), (int32)Stop.RuleSet.Definition);
-						StopObj->SetNumberField(TEXT("duration"), Stop.RuleSet.Duration);
+						StopObj->SetNumberField(TEXT("rule"), (int32)Stop.DockingRuleSet.DockingDefinition);
+						StopObj->SetNumberField(TEXT("duration"), Stop.DockingRuleSet.DockForDuration);
 						StopsArr.Add(MakeShared<FJsonValueObject>(StopObj));
 					}
 					TrainObj->SetArrayField(TEXT("stops"), StopsArr);
@@ -2628,7 +2631,7 @@ FMcpToolResult ToolSetPhase(const TSharedPtr<FJsonObject>& Args)
 
 			// Collect all stations in world to resolve station names / coordinates
 			TArray<AFGTrainStationIdentifier*> AllStations;
-			RS->GetAllTrainStationIdentifiers(AllStations);
+			RS->GetAllTrainStations(AllStations);
 
 			if (StopsJson)
 			{
@@ -2681,14 +2684,14 @@ FMcpToolResult ToolSetPhase(const TSharedPtr<FJsonObject>& Args)
 					double Duration = 0.0;
 					StopObj->TryGetNumberField(TEXT("duration"), Duration);
 
-					Stop.RuleSet.Duration = Duration;
+					Stop.DockingRuleSet.DockForDuration = Duration;
 					if (RuleStr == TEXT("full") || RuleStr == TEXT("fully_load_unload"))
 					{
-						Stop.RuleSet.Definition = (ETrainDockingRuleSetDefinition)1;
+						Stop.DockingRuleSet.DockingDefinition = ETrainDockingDefinition::TDD_FullyLoadUnload;
 					}
 					else
 					{
-						Stop.RuleSet.Definition = (ETrainDockingRuleSetDefinition)0;
+						Stop.DockingRuleSet.DockingDefinition = ETrainDockingDefinition::TDD_LoadUnloadOnce;
 					}
 
 					NewStops.Add(Stop);
