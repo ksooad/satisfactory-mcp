@@ -2597,12 +2597,19 @@ FMcpToolResult ToolSetPhase(const TSharedPtr<FJsonObject>& Args)
 				}
 				if (bNear)
 				{
-					TArray<AFGVehicle*> Vehicles;
-					T->GetVehicles(Vehicles);
-					for (AFGVehicle* V : Vehicles)
+					for (const TObjectPtr<AFGRailroadVehicle>& V : T->mConsistData.Vehicles)
 					{
-						if (!V || !IsValid(V)) continue;
+						if (!V || !IsValid(V.Get())) continue;
 						const float DistSq = FVector::DistSquared(V->GetActorLocation(), NearPos);
+						if (DistSq < BestDistSq)
+						{
+							BestDistSq = DistSq;
+							TargetTrain = T;
+						}
+					}
+					if (AFGLocomotive* Master = T->GetMultipleUnitMaster())
+					{
+						const float DistSq = FVector::DistSquared(Master->GetActorLocation(), NearPos);
 						if (DistSq < BestDistSq)
 						{
 							BestDistSq = DistSq;
